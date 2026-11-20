@@ -30,4 +30,4 @@ e) Write /home/user/v_ID.html and run `python3 promptuy.py video-done ID --file 
 If you really cannot tell what the video is about, run `python3 promptuy.py video-fail ID "коротка причина українською"` instead. Never invent.
 
 ## 4. Finish
-If you did step 2 or 3, run `python3 promptuy.py tick` once more (it sends me the previews with buttons and publish times). If any Telegram call fails, report it clearly. End with one short line: what was published, rewritten, created from videos, failed.
+If you did step 2 or 3, run `python3 promptuy.py tick` once more (it sends me the previews with buttons and publish times). If any Telegram call fails, report it clearly. End with one short line: what was published, rewritten, created from videos, rejected by fact-check, failed.
