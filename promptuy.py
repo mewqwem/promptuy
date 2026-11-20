@@ -1,5 +1,5 @@
 # Promptuy autoposting. Commands: tick | add --file F [--window morning|evening|now] | set-text ID --file F
-# | video-done ID --file F | video-fail ID REASON | lesson TEXT | lessons | status | dm --file F | init
+# | video-done ID --file F --check C | video-reject ID --check C | video-fail ID REASON | lesson TEXT | lessons | status | dm --file F | init
 # | setup-commands. State = pinned JSON in the storage channel.
 import html, json, os, random, re, sys, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timedelta, timezone
@@ -232,6 +232,8 @@ def tick(st):
             head = '📝 <b>Пост готовий.</b> Якщо нічого не натиснеш, опублікую ' + when(deadline) + '.'
             if p.get('source_url'):
                 head += NL + '🎬 За відео: ' + html.escape(p['source_url'])
+            if p.get('check'):
+                head += NL + '🔎 <b>Перевірка:</b> ' + html.escape(p['check'])
             msg = send_html(OWNER, head + NL + NL + p['text'], reply_markup=keyboard(p['id']))
             p.update(status='notified', preview_msg_id=msg['message_id'], notified_at=iso(t), publish_at=iso(deadline))
             print('NOTIFIED', p['id'])
@@ -266,6 +268,15 @@ def fail_request(r, reason):
     r.update(status='failed', reason=reason)
     send_html(OWNER, '😕 Не вийшло зробити пост з відео ' + html.escape(r['url']) + NL + html.escape(reason))
     print('VIDEO FAILED', r['id'], reason)
+
+
+def read_check(args):
+    if '--check' not in args:
+        raise SystemExit('--check FILE is required: fact-check verdict for the owner')
+    txt = open(args[args.index('--check') + 1], encoding='utf-8').read().strip()
+    if not txt:
+        raise SystemExit('empty fact-check')
+    return txt
 
 
 def get_request(st, rid):
@@ -316,12 +327,21 @@ def main():
         print('UPDATED', p['id'], '- run tick to send the new preview')
     elif cmd == 'video-done':
         r = get_request(st, args[0])
+        check = read_check(args)
         pid = uuid.uuid4().hex[:6]
         st['posts'].append({'id': pid, 'text': read_file(args), 'status': 'queued', 'created': iso(now()),
-                            'window': 'video', 'notify_at': iso(now()), 'scheduled_at': iso(next_slot(st)), 'source_url': r['url']})
-        r.update(status='done', post_id=pid)
+                            'window': 'video', 'notify_at': iso(now()), 'scheduled_at': iso(next_slot(st)),
+                            'source_url': r['url'], 'check': check})
+        r.update(status='done', post_id=pid, check=check)
         save(st)
         print('ADDED', pid, 'from video', r['id'], 'publish', when(parse(st['posts'][-1]['scheduled_at'])), '- run tick to send the preview')
+    elif cmd == 'video-reject':
+        r = get_request(st, args[0])
+        check = read_check(args)
+        r.update(status='rejected', check=check)
+        send_html(OWNER, '🚫 <b>Не став робити пост:</b> відео не пройшло перевірку.' + NL + html.escape(r['url']) + NL + NL + html.escape(check))
+        print('VIDEO REJECTED', r['id'])
+        save(st)
     elif cmd == 'video-fail':
         fail_request(get_request(st, args[0]), ' '.join(args[1:]) or 'без пояснення')
         save(st)
