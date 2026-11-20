@@ -1,5 +1,6 @@
 # Promptuy autoposting. Commands: tick | add --file F [--window morning|evening|now] | set-text ID --file F
-# | lesson TEXT | lessons | status | dm --file F | init. State = pinned JSON in the storage channel.
+# | video-done ID --file F | video-fail ID REASON | lesson TEXT | lessons | status | dm --file F | init
+# | setup-commands. State = pinned JSON in the storage channel.
 import html, json, os, random, re, sys, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -14,6 +15,11 @@ OWNER = str(os.environ['TG_CHAT_ID'])
 NL = chr(10)
 CRLF = chr(13) + chr(10)
 FINAL = ('published', 'cancelled')
+VIDEO_HOSTS = ('tiktok.com', 'youtube.com', 'youtu.be', 'instagram.com')
+MAX_TRIES = 3
+SLOT_DAY = (9, 0, 21, 30)
+SLOT_GAP_MIN = (120, 180)
+TICK_MINUTE = 17  # the publisher routine runs at HH:17
 
 
 def api(method, files=None, **params):
@@ -68,10 +74,6 @@ def parse(s):
     return datetime.fromisoformat(s)
 
 
-def hhmm(dt):
-    return dt.astimezone(TZ).strftime('%H:%M')
-
-
 def load():
     pin = must(api('getChat', chat_id=STORE), 'getChat').get('pinned_message') or {}
     if not pin.get('document'):
@@ -80,6 +82,7 @@ def load():
     with urllib.request.urlopen('https://api.telegram.org/file/bot' + TOKEN + '/' + path, timeout=40) as r:
         st = json.load(r)
     st['_pinned_id'] = pin['message_id']
+    st.setdefault('requests', [])
     return st
 
 
@@ -113,6 +116,43 @@ def keyboard(pid):
         {'text': '✅ Публікуй зараз', 'callback_data': 'ok:' + pid},
         {'text': '✏️ Редагувати', 'callback_data': 'ed:' + pid},
         {'text': '❌ Скасувати', 'callback_data': 'no:' + pid}]]}
+
+
+def video_urls(txt):
+    urls = re.findall('https?://[^ ' + NL + ']+', txt)
+    return [u for u in urls if txt.startswith('/post') or any(h in u for h in VIDEO_HOSTS)]
+
+
+def when(dt):
+    tick_at = dt.replace(minute=TICK_MINUTE, second=0, microsecond=0)
+    dt = tick_at if tick_at >= dt else tick_at + timedelta(hours=1)
+    local, today = dt.astimezone(TZ), now().astimezone(TZ).date()
+    day = {0: 'сьогодні', 1: 'завтра'}.get((local.date() - today).days, local.strftime('%d.%m'))
+    return day + ' ~о ' + local.strftime('%H:%M')
+
+
+def deadline_for(p, t):
+    d = t + timedelta(minutes=REVIEW_MIN)
+    if p.get('scheduled_at') and parse(p['scheduled_at']) > d:
+        d = parse(p['scheduled_at'])
+    return d
+
+
+def next_slot(st):
+    t = now()
+    cand = t + timedelta(minutes=REVIEW_MIN)
+    busy = [parse(p.get('scheduled_at') or p.get('publish_at') or p['notify_at']) for p in st['posts'] if p['status'] not in FINAL]
+    later = [b for b in busy if b > t]
+    if later:
+        cand = max(cand, max(later) + timedelta(minutes=random.randint(*SLOT_GAP_MIN)))
+    local = cand.astimezone(TZ)
+    h1, m1, h2, m2 = SLOT_DAY
+    start = local.replace(hour=h1, minute=m1, second=0, microsecond=0)
+    if local < start:
+        local = start + timedelta(minutes=random.randint(0, 40))
+    elif local > local.replace(hour=h2, minute=m2, second=0, microsecond=0):
+        local = start + timedelta(days=1, minutes=random.randint(0, 40))
+    return local.astimezone(timezone.utc)
 
 
 def find(st, pid):
@@ -165,7 +205,18 @@ def tick(st):
                 p['status'] = 'edit_requested'
             continue
         m = u.get('message')
-        if m and str(m['chat']['id']) == OWNER and m.get('text') and not m['text'].startswith('/'):
+        txt = ((m or {}).get('text') or '').strip()
+        if not m or str(m['chat']['id']) != OWNER or not txt:
+            continue
+        urls = video_urls(txt)
+        if urls:
+            for url in urls:
+                st['requests'].append({'id': uuid.uuid4().hex[:6], 'url': url, 'status': 'pending', 'created': iso(t), 'tries': 0})
+            n = len([r for r in st['requests'] if r['status'] == 'pending'])
+            send_html(OWNER, '🎬 Прийняв, у черзі відео: ' + str(n) + '. Пости пришлю превʼю сюди і розкладу по годинах.')
+        elif txt.startswith('/post'):
+            send_html(OWNER, 'Надішли так: /post і посилання на TikTok, YouTube Shorts або Reels.')
+        elif not txt.startswith('/'):
             waiting = [p for p in st['posts'] if p['status'] == 'feedback_asked']
             if waiting:
                 waiting[-1].update(feedback=m['text'], status='rewrite_needed')
@@ -177,27 +228,51 @@ def tick(st):
         if s == 'approved':
             publish(p)
         elif s == 'queued' and parse(p['notify_at']) <= t:
-            deadline = t + timedelta(minutes=REVIEW_MIN)
-            head = '📝 <b>Пост готовий.</b> Якщо нічого не натиснеш, опублікую ~о ' + hhmm(deadline + timedelta(minutes=5)) + '.'
+            deadline = deadline_for(p, t)
+            head = '📝 <b>Пост готовий.</b> Якщо нічого не натиснеш, опублікую ' + when(deadline) + '.'
+            if p.get('source_url'):
+                head += NL + '🎬 За відео: ' + html.escape(p['source_url'])
             msg = send_html(OWNER, head + NL + NL + p['text'], reply_markup=keyboard(p['id']))
             p.update(status='notified', preview_msg_id=msg['message_id'], notified_at=iso(t), publish_at=iso(deadline))
             print('NOTIFIED', p['id'])
         elif s in ('notified', 'feedback_asked') and parse(p['publish_at']) <= t:
             publish(p)
         elif s == 'edit_requested':
-            deadline = t + timedelta(minutes=REVIEW_MIN)
+            deadline = deadline_for(p, t)
             api('editMessageReplyMarkup', chat_id=OWNER, message_id=p['preview_msg_id'], reply_markup={'inline_keyboard': []})
             ask = ('✏️ <b>Що не так з постом?</b> Напиши одним повідомленням, я перепишу і врахую на майбутнє.' + NL +
-                   'Якщо не відповіси, опублікую як є ~о ' + hhmm(deadline + timedelta(minutes=5)) + '.')
+                   'Якщо не відповіси, опублікую як є ' + when(deadline) + '.')
             send_html(OWNER, ask, reply_parameters=reply_to(p))
             p.update(status='feedback_asked', asked_at=iso(t), publish_at=iso(deadline))
             print('ASKED', p['id'])
         elif s == 'rewrite_needed':
             print(NL.join(['REWRITE ' + p['id'], '--- FEEDBACK ---', p['feedback'], '--- CURRENT TEXT ---', p['text'], '--- END ---']))
+    for r in st['requests']:
+        if r['status'] != 'pending':
+            continue
+        r['tries'] = r.get('tries', 0) + 1
+        if r['tries'] > MAX_TRIES:
+            fail_request(r, 'не вдалося за ' + str(MAX_TRIES) + ' спроби')
+        else:
+            print('VIDEO ' + r['id'] + ' ' + r['url'])
     cutoff = t - timedelta(days=30)
     st['posts'] = [p for p in st['posts'] if p['status'] not in FINAL or parse(p.get('published_at') or p['created']) > cutoff]
+    st['requests'] = [r for r in st['requests'] if r['status'] == 'pending' or parse(r['created']) > cutoff]
     save(st)
     print('QUEUE', ' '.join(p['id'] + ':' + p['status'] for p in st['posts'] if p['status'] not in FINAL) or 'empty')
+
+
+def fail_request(r, reason):
+    r.update(status='failed', reason=reason)
+    send_html(OWNER, '😕 Не вийшло зробити пост з відео ' + html.escape(r['url']) + NL + html.escape(reason))
+    print('VIDEO FAILED', r['id'], reason)
+
+
+def get_request(st, rid):
+    r = next((r for r in st['requests'] if r['id'] == rid), None)
+    if not r:
+        raise SystemExit('no such video request')
+    return r
 
 
 def read_file(args):
@@ -210,6 +285,11 @@ def main():
         backlog = must(api('getUpdates', timeout=0), 'getUpdates')
         save({'version': 2, 'offset': backlog[-1]['update_id'] if backlog else 0, 'posts': [], 'lessons': []})
         print('INIT ok')
+        return
+    if cmd == 'setup-commands':
+        must(api('setMyCommands', commands=[{'command': 'post', 'description': 'Пост у Промптуй з TikTok / Shorts / Reels'}],
+                 scope={'type': 'chat', 'chat_id': int(OWNER)}), 'setMyCommands')
+        print('COMMANDS ok')
         return
     if cmd == 'dm':
         send_html(OWNER, read_file(args), link_preview_options={'is_disabled': True})
@@ -234,6 +314,17 @@ def main():
         p.update(text=read_file(args), status='queued', notify_at=iso(now()), feedback=None)
         save(st)
         print('UPDATED', p['id'], '- run tick to send the new preview')
+    elif cmd == 'video-done':
+        r = get_request(st, args[0])
+        pid = uuid.uuid4().hex[:6]
+        st['posts'].append({'id': pid, 'text': read_file(args), 'status': 'queued', 'created': iso(now()),
+                            'window': 'video', 'notify_at': iso(now()), 'scheduled_at': iso(next_slot(st)), 'source_url': r['url']})
+        r.update(status='done', post_id=pid)
+        save(st)
+        print('ADDED', pid, 'from video', r['id'], 'publish', when(parse(st['posts'][-1]['scheduled_at'])), '- run tick to send the preview')
+    elif cmd == 'video-fail':
+        fail_request(get_request(st, args[0]), ' '.join(args[1:]) or 'без пояснення')
+        save(st)
     elif cmd == 'lesson':
         st['lessons'].append({'date': iso(now())[:10], 'text': ' '.join(args), 'source': 'agent'})
         save(st)
